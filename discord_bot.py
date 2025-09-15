@@ -76,11 +76,22 @@ class AttendButton(discord.ui.View):
             await interaction.response.send_message("You are already attending this operation!", ephemeral=True)
             return
         
-        # Add user to attendees
+        # Check if operation is at max capacity
+        if operation_data.get('max_attendees') and len(operation_data['attendees']) >= operation_data['max_attendees']:
+            await interaction.response.send_message("This operation is at maximum capacity!", ephemeral=True)
+            return
+        
+        # Add user to attendees and store username for leaderboard
         operation_data['attendees'][str(user.id)] = {
             'username': member.display_name,
             'joined_at': datetime.now().isoformat()
         }
+        
+        # Store username for future leaderboard use
+        guild_id_str = str(guild.id)
+        if guild_id_str not in bot_data.setdefault('usernames', {}):
+            bot_data['usernames'][guild_id_str] = {}
+        bot_data['usernames'][guild_id_str][str(user.id)] = member.display_name
         
         # Give user the operation role
         role_name = f"Operation_{operation_data['date']}"
@@ -90,10 +101,19 @@ class AttendButton(discord.ui.View):
         
         await member.add_roles(role)
         
-        # Update the embed
+        # Update the embed with all operation info
+        embed_description = f"**Airport:** {operation_data['airport']}\n**Time:** {operation_data['time']}\n**Date:** {operation_data['date']}"
+        
+        if operation_data.get('operation_type'):
+            embed_description += f"\n**Type:** {operation_data['operation_type']}"
+        if operation_data.get('description'):
+            embed_description += f"\n**Description:** {operation_data['description']}"
+        if operation_data.get('max_attendees'):
+            embed_description += f"\n**Max Attendees:** {operation_data['max_attendees']}"
+        
         embed = discord.Embed(
             title="📢 OPERATION ACTIVE",
-            description=f"**Airport:** {operation_data['airport']}\n**Time:** {operation_data['time']}\n**Date:** {operation_data['date']}",
+            description=embed_description,
             color=discord.Color.green(),
             timestamp=datetime.now()
         )
@@ -102,10 +122,19 @@ class AttendButton(discord.ui.View):
         for attendee_data in operation_data['attendees'].values():
             attendees_list.append(f"• {attendee_data['username']}")
         
-        if attendees_list:
-            embed.add_field(name=f"Attendees ({len(attendees_list)})", value="\n".join(attendees_list), inline=False)
+        # Show attendee count with capacity if applicable
+        attendee_count = len(attendees_list)
+        max_attendees = operation_data.get('max_attendees')
+        
+        if max_attendees:
+            attendee_header = f"Attendees ({attendee_count}/{max_attendees})"
         else:
-            embed.add_field(name="Attendees (0)", value="No attendees yet", inline=False)
+            attendee_header = f"Attendees ({attendee_count})"
+        
+        if attendees_list:
+            embed.add_field(name=attendee_header, value="\n".join(attendees_list), inline=False)
+        else:
+            embed.add_field(name=attendee_header, value="No attendees yet", inline=False)
         
         embed.set_footer(text="ATC24 PTFS Ground Crew")
         
@@ -212,12 +241,15 @@ class AddTimeModal(discord.ui.Modal):
                 await interaction.response.send_message("User not found.", ephemeral=True)
                 return
             
-            # Parse time
-            minutes = int(self.time_input.value)
-            
-            # Add time to user's total
+            # Store username for leaderboard
             guild_id = str(interaction.guild.id)
             user_id_str = str(user_id)
+            if guild_id not in bot_data.setdefault('usernames', {}):
+                bot_data['usernames'][guild_id] = {}
+            bot_data['usernames'][guild_id][user_id_str] = user.display_name
+            
+            # Parse time
+            minutes = int(self.time_input.value)
             
             if guild_id not in bot_data['shift_totals']:
                 bot_data['shift_totals'][guild_id] = {}
@@ -273,12 +305,15 @@ class RemoveTimeModal(discord.ui.Modal):
                 await interaction.response.send_message("User not found.", ephemeral=True)
                 return
             
-            # Parse time
-            minutes = int(self.time_input.value)
-            
-            # Remove time from user's total
+            # Store username for leaderboard
             guild_id = str(interaction.guild.id)
             user_id_str = str(user_id)
+            if guild_id not in bot_data.setdefault('usernames', {}):
+                bot_data['usernames'][guild_id] = {}
+            bot_data['usernames'][guild_id][user_id_str] = user.display_name
+            
+            # Parse time
+            minutes = int(self.time_input.value)
             
             if guild_id not in bot_data['shift_totals']:
                 bot_data['shift_totals'][guild_id] = {}
@@ -328,9 +363,12 @@ class EndShiftModal(discord.ui.Modal):
                 await interaction.response.send_message("User not found.", ephemeral=True)
                 return
             
-            # End user's shift
+            # Store username for leaderboard
             guild_id = str(interaction.guild.id)
             user_id_str = str(user_id)
+            if guild_id not in bot_data.setdefault('usernames', {}):
+                bot_data['usernames'][guild_id] = {}
+            bot_data['usernames'][guild_id][user_id_str] = user.display_name
             
             if guild_id in bot_data['shifts'] and user_id_str in bot_data['shifts'][guild_id]:
                 shift_data = bot_data['shifts'][guild_id][user_id_str]
@@ -383,7 +421,15 @@ async def generate_leaderboard_embed(guild):
     leaderboard_text = ""
     for i, (user_id, total_minutes) in enumerate(sorted_users[:10]):
         user = guild.get_member(int(user_id))
-        username = user.display_name if user else f"User {user_id}"
+        
+        # Try to get username from stored usernames first, then current member, then fallback
+        stored_usernames = bot_data.get('usernames', {}).get(guild_id, {})
+        if user:
+            username = user.display_name
+        elif user_id in stored_usernames:
+            username = stored_usernames[user_id]
+        else:
+            username = f"User {user_id}"
         
         hours = total_minutes // 60
         minutes = total_minutes % 60
@@ -459,8 +505,27 @@ async def setup(interaction: discord.Interaction, operation_role: discord.Role, 
 @bot.tree.command(name="operation-start", description="Start a new operation (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.guild_only()
-@app_commands.describe(airport="Airport code", time="Operation time", date="Operation date")
-async def operation_start(interaction: discord.Interaction, airport: str, time: str, date: str):
+@app_commands.describe(
+    airport="Airport code", 
+    time="Operation time", 
+    date="Operation date",
+    description="Optional description or notes about the operation",
+    max_attendees="Maximum number of attendees (leave blank for unlimited)",
+    operation_type="Type of operation (e.g., Training, Event, Regular)"
+)
+async def operation_start(
+    interaction: discord.Interaction, 
+    airport: str, 
+    time: str, 
+    date: str,
+    description: Optional[str] = None,
+    max_attendees: Optional[int] = None,
+    operation_type: Optional[str] = None
+):
+    # Validate max_attendees
+    if max_attendees is not None and max_attendees < 1:
+        await interaction.response.send_message("Max attendees must be at least 1.", ephemeral=True)
+        return
     global bot_data
     
     # Guild is guaranteed to exist due to @app_commands.guild_only()
@@ -483,6 +548,9 @@ async def operation_start(interaction: discord.Interaction, airport: str, time: 
         'airport': airport,
         'time': time,
         'date': date,
+        'description': description,
+        'max_attendees': max_attendees,
+        'operation_type': operation_type,
         'started_by': interaction.user.id,
         'started_at': datetime.now().isoformat(),
         'attendees': {}
@@ -491,10 +559,19 @@ async def operation_start(interaction: discord.Interaction, airport: str, time: 
     bot_data['active_operations'][operation_id] = operation_data
     save_data(bot_data)
     
-    # Create embed
+    # Create embed with additional info
+    embed_description = f"**Airport:** {airport}\n**Time:** {time}\n**Date:** {date}"
+    
+    if operation_type:
+        embed_description += f"\n**Type:** {operation_type}"
+    if description:
+        embed_description += f"\n**Description:** {description}"
+    if max_attendees:
+        embed_description += f"\n**Max Attendees:** {max_attendees}"
+    
     embed = discord.Embed(
         title="📢 OPERATION ACTIVE",
-        description=f"**Airport:** {airport}\n**Time:** {time}\n**Date:** {date}",
+        description=embed_description,
         color=discord.Color.green(),
         timestamp=datetime.now()
     )
@@ -591,6 +668,11 @@ async def clock_in(interaction: discord.Interaction, airport: str):
     # Get member for display_name
     member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
     display_name = member.display_name if member else interaction.user.name
+    
+    # Store username for future leaderboard use
+    if guild_id not in bot_data.setdefault('usernames', {}):
+        bot_data['usernames'][guild_id] = {}
+    bot_data['usernames'][guild_id][user_id] = display_name
     
     # Clock in the user
     bot_data['shifts'][guild_id][user_id] = {
