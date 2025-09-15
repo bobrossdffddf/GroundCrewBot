@@ -5,13 +5,11 @@ import json
 import asyncio
 from datetime import datetime, timedelta
 import os
-from typing import Optional
+from typing import Optional, cast
 
-# Bot setup
+# Bot setup - using only non-privileged intents for slash commands
 intents = discord.Intents.default()
-intents.message_content = True
 intents.guilds = True
-intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
@@ -43,13 +41,28 @@ class AttendButton(discord.ui.View):
     def __init__(self, operation_id):
         super().__init__(timeout=None)
         self.operation_id = operation_id
+        
+        # Set custom_id after button creation for persistence
+        for item in self.children:
+            if isinstance(item, discord.ui.Button) and item.label == 'Attend':
+                item.custom_id = f"attend_operation_{operation_id}"
 
     @discord.ui.button(label='Attend', style=discord.ButtonStyle.green, emoji='✋')
     async def attend_operation(self, interaction: discord.Interaction, button: discord.ui.Button):
         global bot_data
         
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
+        
         guild = interaction.guild
         user = interaction.user
+        
+        # Get member object
+        member = user if isinstance(user, discord.Member) else guild.get_member(user.id)
+        if member is None:
+            await interaction.response.send_message("Could not find your member information.", ephemeral=True)
+            return
         
         # Get operation data
         if self.operation_id not in bot_data['active_operations']:
@@ -59,13 +72,13 @@ class AttendButton(discord.ui.View):
         operation_data = bot_data['active_operations'][self.operation_id]
         
         # Check if user is already attending
-        if user.id in operation_data['attendees']:
+        if str(user.id) in operation_data['attendees']:
             await interaction.response.send_message("You are already attending this operation!", ephemeral=True)
             return
         
         # Add user to attendees
         operation_data['attendees'][str(user.id)] = {
-            'username': user.display_name,
+            'username': member.display_name,
             'joined_at': datetime.now().isoformat()
         }
         
@@ -75,7 +88,7 @@ class AttendButton(discord.ui.View):
         if not role:
             role = await guild.create_role(name=role_name, color=discord.Color.blue())
         
-        await user.add_roles(role)
+        await member.add_roles(role)
         
         # Update the embed
         embed = discord.Embed(
@@ -130,6 +143,11 @@ class ShiftManageView(discord.ui.View):
 
     async def send_leaderboard_update(self, interaction):
         global bot_data
+        
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
+        
         config = bot_data['config'].get(str(interaction.guild.id), {})
         leaderboard_channel_id = config.get('leaderboard_channel')
         
@@ -138,8 +156,8 @@ class ShiftManageView(discord.ui.View):
             return
         
         channel = bot.get_channel(leaderboard_channel_id)
-        if not channel:
-            await interaction.response.send_message("Leaderboard channel not found.", ephemeral=True)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("Leaderboard channel not found or is not a text channel.", ephemeral=True)
             return
         
         # Generate leaderboard
@@ -147,7 +165,8 @@ class ShiftManageView(discord.ui.View):
         
         # Send or update leaderboard message
         async for message in channel.history(limit=10):
-            if message.author == bot.user and message.embeds and "Shift Time Leaderboard" in message.embeds[0].title:
+            if (message.author == bot.user and message.embeds and 
+                message.embeds[0].title and "Shift Time Leaderboard" in message.embeds[0].title):
                 await message.edit(embed=leaderboard_embed)
                 await interaction.response.send_message("Leaderboard updated!", ephemeral=True)
                 return
@@ -175,6 +194,10 @@ class AddTimeModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         global bot_data
+        
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
         
         try:
             # Parse user
@@ -233,6 +256,10 @@ class RemoveTimeModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         global bot_data
         
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
+        
         try:
             # Parse user
             user_str = self.user_input.value.strip()
@@ -283,6 +310,10 @@ class EndShiftModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         global bot_data
+        
+        if interaction.guild is None:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
         
         try:
             # Parse user
@@ -381,15 +412,19 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s)")
     except Exception as e:
         print(f"Failed to sync commands: {e}")
+    
+    # Register persistent views for button persistence across restarts
+    # This allows buttons to work even after bot restarts
+    for operation_id in bot_data.get('active_operations', {}).keys():
+        view = AttendButton(operation_id)
+        bot.add_view(view)
 
-# Admin check decorator
-def is_admin():
-    def predicate(interaction: discord.Interaction) -> bool:
-        return interaction.user.guild_permissions.administrator
-    return app_commands.check(predicate)
+# Admin check decorator - using built-in has_permissions
+# This replaces the custom is_admin check to avoid type issues
 
 @bot.tree.command(name="setup", description="Configure bot settings (Admin only)")
-@is_admin()
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
 @app_commands.describe(
     operation_role="Role to ping for operations",
     operation_channel="Channel for operation announcements",
@@ -398,6 +433,8 @@ def is_admin():
 async def setup(interaction: discord.Interaction, operation_role: discord.Role, operation_channel: discord.TextChannel, leaderboard_channel: discord.TextChannel):
     global bot_data
     
+    # Guild is guaranteed to exist due to @app_commands.guild_only()
+    assert interaction.guild is not None
     guild_id = str(interaction.guild.id)
     
     if guild_id not in bot_data['config']:
@@ -420,11 +457,14 @@ async def setup(interaction: discord.Interaction, operation_role: discord.Role, 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="operation-start", description="Start a new operation (Admin only)")
-@is_admin()
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
 @app_commands.describe(airport="Airport code", time="Operation time", date="Operation date")
 async def operation_start(interaction: discord.Interaction, airport: str, time: str, date: str):
     global bot_data
     
+    # Guild is guaranteed to exist due to @app_commands.guild_only()
+    assert interaction.guild is not None
     guild_id = str(interaction.guild.id)
     config = bot_data['config'].get(guild_id, {})
     
@@ -432,8 +472,8 @@ async def operation_start(interaction: discord.Interaction, airport: str, time: 
         await interaction.response.send_message("Please run /setup first to configure the bot.", ephemeral=True)
         return
     
-    # Check if there's already an active operation
-    if guild_id in bot_data['active_operations']:
+    # Check if there's already an active operation for this guild
+    if any(op_id.startswith(f"{guild_id}_") for op_id in bot_data['active_operations']):
         await interaction.response.send_message("There is already an active operation. Please stop it first with /operation-stop.", ephemeral=True)
         return
     
@@ -465,50 +505,58 @@ async def operation_start(interaction: discord.Interaction, airport: str, time: 
     role = interaction.guild.get_role(config['operation_role_id'])
     channel = interaction.guild.get_channel(config['operation_channel_id'])
     
-    if not role or not channel:
-        await interaction.response.send_message("Operation role or channel not found. Please run /setup again.", ephemeral=True)
+    if not role:
+        await interaction.response.send_message("Operation role not found. Please run /setup again.", ephemeral=True)
+        return
+    
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("Operation channel not found or is not a text channel. Please run /setup again.", ephemeral=True)
         return
     
     # Send message with button
     view = AttendButton(operation_id)
+    # Register the view for persistence
+    bot.add_view(view)
     message = await channel.send(content=f"{role.mention} New operation starting!", embed=embed, view=view)
     
     await interaction.response.send_message(f"Operation started successfully in {channel.mention}!", ephemeral=True)
 
 @bot.tree.command(name="operation-stop", description="Stop the current operation (Admin only)")
-@is_admin()
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
 async def operation_stop(interaction: discord.Interaction):
     global bot_data
     
+    # Guild is guaranteed to exist due to @app_commands.guild_only()
+    assert interaction.guild is not None
     guild_id = str(interaction.guild.id)
     config = bot_data['config'].get(guild_id, {})
     
-    # Find active operation for this guild
-    operation_to_stop = None
-    for op_id, op_data in bot_data['active_operations'].items():
-        if op_id.startswith(guild_id):
-            operation_to_stop = op_id
-            break
+    # Find and stop all active operations for this guild
+    operations_to_stop = [op_id for op_id in bot_data['active_operations'].keys() if op_id.startswith(f"{guild_id}_")]
     
-    if not operation_to_stop:
+    if not operations_to_stop:
         await interaction.response.send_message("No active operation found.", ephemeral=True)
         return
     
-    operation_data = bot_data['active_operations'][operation_to_stop]
+    # Stop all operations and clean up roles
+    for operation_id in operations_to_stop:
+        operation_data = bot_data['active_operations'][operation_id]
+        
+        # Delete the operation role if it exists
+        role_name = f"Operation_{operation_data['date']}"
+        role = discord.utils.get(interaction.guild.roles, name=role_name)
+        if role:
+            await role.delete()
+        
+        # Remove operation from active operations
+        del bot_data['active_operations'][operation_id]
     
-    # Delete the operation role if it exists
-    role_name = f"Operation_{operation_data['date']}"
-    role = discord.utils.get(interaction.guild.roles, name=role_name)
-    if role:
-        await role.delete()
-    
-    # Remove operation from active operations
-    del bot_data['active_operations'][operation_to_stop]
     save_data(bot_data)
     
     # Send end message
     channel = interaction.guild.get_channel(config.get('operation_channel_id'))
-    if channel:
+    if isinstance(channel, discord.TextChannel):
         embed = discord.Embed(
             title="🔴 OPERATION ENDED",
             description="This operation has ended. Thank you all for attending!",
@@ -521,10 +569,13 @@ async def operation_stop(interaction: discord.Interaction):
     await interaction.response.send_message("Operation stopped successfully!", ephemeral=True)
 
 @bot.tree.command(name="clock-in", description="Start your shift")
+@app_commands.guild_only()
 @app_commands.describe(airport="Airport you're working at")
 async def clock_in(interaction: discord.Interaction, airport: str):
     global bot_data
     
+    # Guild is guaranteed to exist due to @app_commands.guild_only()
+    assert interaction.guild is not None
     guild_id = str(interaction.guild.id)
     user_id = str(interaction.user.id)
     
@@ -537,11 +588,15 @@ async def clock_in(interaction: discord.Interaction, airport: str):
         await interaction.response.send_message("You are already clocked in! Use /clock-out to end your shift first.", ephemeral=True)
         return
     
+    # Get member for display_name
+    member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+    display_name = member.display_name if member else interaction.user.name
+    
     # Clock in the user
     bot_data['shifts'][guild_id][user_id] = {
         'airport': airport,
         'start_time': datetime.now().isoformat(),
-        'username': interaction.user.display_name
+        'username': display_name
     }
     
     save_data(bot_data)
@@ -557,9 +612,12 @@ async def clock_in(interaction: discord.Interaction, airport: str):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="clock-out", description="End your shift")
+@app_commands.guild_only()
 async def clock_out(interaction: discord.Interaction):
     global bot_data
     
+    # Guild is guaranteed to exist due to @app_commands.guild_only()
+    assert interaction.guild is not None
     guild_id = str(interaction.guild.id)
     user_id = str(interaction.user.id)
     
@@ -603,10 +661,13 @@ async def clock_out(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="shift-manage", description="Manage shifts (Admin only)")
-@is_admin()
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
 async def shift_manage(interaction: discord.Interaction):
     global bot_data
     
+    # Guild is guaranteed to exist due to @app_commands.guild_only()
+    assert interaction.guild is not None
     guild_id = str(interaction.guild.id)
     
     # Get active shifts
@@ -641,6 +702,7 @@ async def shift_manage(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 @bot.tree.command(name="leaderboard", description="Show shift time leaderboard")
+@app_commands.guild_only()
 async def leaderboard(interaction: discord.Interaction):
     embed = await generate_leaderboard_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -653,6 +715,8 @@ async def leaderboard(interaction: discord.Interaction):
 async def admin_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("You need administrator permissions to use this command.", ephemeral=True)
+    elif isinstance(error, app_commands.NoPrivateMessage):
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
     else:
         await interaction.response.send_message(f"An error occurred: {str(error)}", ephemeral=True)
 
